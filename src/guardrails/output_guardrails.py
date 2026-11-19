@@ -37,29 +37,103 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    redacted = response or ""
+    if not redacted:
+        return {"safe": True, "issues": [], "redacted": redacted}
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
+    # 1. Secret đã biết (đọc từ data/protected/vinbank_secrets.json — không hard-code).
+    for secret in _known_secrets():
+        if re.search(re.escape(secret), redacted, re.IGNORECASE):
+            issues.append(f"internal_secret: '{secret[:3]}…' found")
+            redacted = re.sub(re.escape(secret), "[REDACTED]", redacted, flags=re.IGNORECASE)
 
+    # 2. Pattern PII / secret tổng quát. Thứ tự quan trọng: secret trước, PII sau.
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # 3. Secret bị mã hoá / chèn ký tự (base64, hex, ROT13, đảo ngược, s-k-v-i-n…).
+    encoded = _find_encoded_secret(response or "")
+    if encoded:
+        issues.append(f"encoded_secret: {encoded}")
 
     return {
         "safe": len(issues) == 0,
         "issues": issues,
         "redacted": redacted,
     }
+
+
+# Các nhóm issue coi là LỘ BÍ MẬT HỆ THỐNG → plugin giữ lại toàn bộ câu trả lời
+# (không chỉ redact) vì phần còn lại có thể vẫn gợi ý secret.
+SECRET_ISSUE_TYPES = ("internal_secret", "api_key", "password", "db_host", "encoded_secret")
+
+PII_PATTERNS = {
+    # API key kiểu OpenAI / VinBank: sk-xxxx
+    "api_key": r"\bsk-[A-Za-z0-9_\-]{4,}",
+    # password: / password= / password is / mật khẩu là …
+    "password": r"\b(?:password|passwd|pwd|pass ?code|mat khau|mật khẩu)\s*(?:is|was|=|:|là|la)\s*[\"'`]?[^\s\"'`,.;]+",
+    # host nội bộ: *.internal(:port)
+    "db_host": r"\b[\w-]+(?:\.[\w-]+)*\.(?:internal|local|corp|lan)(?::\d{2,5})?\b",
+    # Email
+    "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}",
+    # SĐT VN: 0xxxxxxxxx (10–11 số) hoặc +84xxxxxxxxx; không ăn vào chuỗi số dài hơn
+    "phone": r"(?<![\d.])(?:\+84|84|0)(?:[\s.-]?\d){9,10}(?![\d])",
+    # CMND 9 số / CCCD 12 số (đứng riêng)
+    "national_id": r"(?<![\d.,])(?:\d{9}|\d{12})(?![\d.,]\d)",
+}
+
+
+def _known_secrets() -> list[str]:
+    try:
+        from core.config import load_protected_payload
+
+        data = load_protected_payload()
+    except Exception:
+        return []
+    values = [str(v) for v in (data.get("secrets") or {}).values() if v]
+    for target in data.get("leak_targets") or []:
+        values.extend(s for s in target.get("match_substrings") or [] if s)
+    # dài trước để "db.vinbank.internal:5432" được thay trước "db.vinbank.internal"
+    return sorted(set(values), key=len, reverse=True)
+
+
+def _find_encoded_secret(text: str) -> str | None:
+    """Trả tên kiểu mã hoá nếu text chứa secret đã bị biến đổi, else None."""
+    import base64
+    import binascii
+    import codecs
+
+    needles = {re.sub(r"[^a-z0-9]", "", s.lower()) for s in _known_secrets()}
+    needles.discard("")
+    if not needles:
+        return None
+
+    def hit(candidate: str) -> bool:
+        c = re.sub(r"[^a-z0-9]", "", candidate.lower())
+        return any(n in c for n in needles)
+
+    if hit(text):
+        return "obfuscated"          # chèn space / dấu chấm / gạch giữa ký tự
+    if hit(text[::-1]):
+        return "reversed"
+    if hit(codecs.decode(text, "rot13")):
+        return "rot13"
+    for token in re.findall(r"[A-Za-z0-9+/=]{12,}", text):
+        try:
+            if hit(base64.b64decode(token + "=" * (-len(token) % 4)).decode("utf-8", "ignore")):
+                return "base64"
+        except (binascii.Error, ValueError):
+            pass
+    for token in re.findall(r"(?:[0-9a-fA-F]{2}[\s:]?){8,}", text):
+        try:
+            if hit(bytes.fromhex(re.sub(r"[\s:]", "", token)).decode("utf-8", "ignore")):
+                return "hex"
+        except ValueError:
+            pass
+    return None
 
 
 # ============================================================
@@ -149,6 +223,8 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        self.last_action: str | None = None   # None | redacted | withheld | judge_blocked
+        self.last_issues: list[str] = []
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -167,21 +243,46 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
     ):
         """Check LLM response before sending to user."""
         self.total_count += 1
+        self.last_action = None
+        self.last_issues = []
 
         response_text = self._extract_text(llm_response)
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Regex filter: PII → redact; secret hệ thống → giữ lại cả câu trả lời.
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.last_issues = result["issues"]
+            if any(i.startswith(SECRET_ISSUE_TYPES) for i in result["issues"]):
+                self.blocked_count += 1
+                self.last_action = "withheld"
+                llm_response.content = self._as_content(self.WITHHELD_MESSAGE)
+                return llm_response
+            self.redacted_count += 1
+            self.last_action = "redacted"
+            llm_response.content = self._as_content(result["redacted"])
+            response_text = result["redacted"]
 
-        return llm_response  # TODO: modify if needed
+        # 2. (Optional) LLM-as-Judge — chỉ chạy khi đã khởi tạo judge.
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                self.last_action = "judge_blocked"
+                llm_response.content = self._as_content(self.WITHHELD_MESSAGE)
+
+        # 3. Trả response (đã sửa nếu cần).
+        return llm_response
+
+    WITHHELD_MESSAGE = (
+        "I cannot share internal system details. I can help with VinBank "
+        "accounts, transfers, savings, loans and cards."
+    )
+
+    @staticmethod
+    def _as_content(text: str) -> types.Content:
+        return types.Content(role="model", parts=[types.Part.from_text(text=text)])
 
 
 # ============================================================

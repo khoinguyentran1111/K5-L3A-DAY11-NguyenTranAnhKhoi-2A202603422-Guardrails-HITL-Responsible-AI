@@ -1,5 +1,57 @@
 # Day 11 — Controlled Agent Security (2026)
 
+## 🎓 Bài nộp
+
+| | |
+|---|---|
+| **Họ tên** | Nguyễn Trần Anh Khôi |
+| **MSSV** | 2A202603422 |
+| **Lớp** | K5 · L3A · Day 11 |
+| **Blue** | OpenRouter `liquid/lfm-3-1.7b:free` |
+| **Red / Red Advance** | Gemini `gemini-3.5-flash` |
+
+### Cách chạy
+
+> Cần **Python 3.10–3.13**. `nemoguardrails` không hỗ trợ Python 3.14 (trên máy chỉ có 3.14 thì tạo venv 3.12 bằng `uv venv --python 3.12 .venv`).
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env   # điền OPENROUTER_API_KEY, RED_TEAM_PROVIDER=gemini, GOOGLE_API_KEY
+
+python src/main.py --part 2   # CP2 — guardrails (in terminal)
+python src/main.py --part 3   # CP3 — outputs/results.json, audit_log.json, metrics.json
+python src/main.py --part 4   # CP4 — outputs/attack_results.json (+ unsafe/guards)
+pytest tests/smoke tests/public -q
+python scripts/grade.py --submission-dir . --out outputs/grade_report.json
+```
+
+### Đã làm gì
+
+| CP | File | Nội dung chính |
+|----|------|----------------|
+| 2 | [`src/guardrails/input_guardrails.py`](src/guardrails/input_guardrails.py) | Chuẩn hoá Unicode (NFKC, xoá zero-width, bỏ dấu tiếng Việt, leetspeak) → regex injection / moi secret / mã hoá / roleplay / SQL injection (EN + VI) · topic filter có neo `\b` để tránh khớp nhầm · chặn input > 4000 ký tự |
+| 2 | [`src/guardrails/output_guardrails.py`](src/guardrails/output_guardrails.py) | Redact SĐT VN, email, CMND/CCCD · phát hiện secret (đọc từ `data/protected/`) kể cả dạng base64 / hex / ROT13 / đảo ngược / chèn ký tự → **giữ lại** cả câu trả lời |
+| 3 | [`src/assignment/`](src/assignment/) | Rate limiter sliding-window theo `user_id` · audit log (latency, layer) · monitoring + alert · egress allowlist host chính xác + HTTPS + quét payload · orchestrator `BluePipeline` |
+| 4 | [`src/attacks/attacks.py`](src/attacks/attacks.py) | 5 prompt: Completion (YAML template), Reformatting (CSV), Hypothetical (kịch bản đào tạo), Confirmation (side-channel), Multi-step |
+
+**Thiết kế pipeline:** `RateLimit → InputGuardrail → Blue LLM → OutputGuardrail → Audit + Monitoring`, egress kiểm tra riêng bằng rule code. Pipeline tự orchestrate (thay vì gắn plugin vào `OpenAIRunner`) vì runner starter dùng chung `user_id="student"` → không rate-limit theo user được, và không biết lớp nào chặn.
+
+### Kết quả (sinh tự động — xem [`outputs/lab_report.md`](outputs/lab_report.md))
+
+| | Kết quả |
+|---|---|
+| Safe queries bị chặn nhầm | **0/7** |
+| Attack queries bị chặn | **9/9** |
+| Edge cases bị chặn | **6/6** |
+| Rate limit (blocked/sent) | **5/15** |
+| Leak **Red** | **2/5** (Reformatting, Hypothetical) |
+| Leak **Red Advance** | 0/5 (NeMo input rail chặn cả 5) |
+| Public tests | 10/10 pass |
+
+---
+
 > 👤 **Hình thức:** bài tập **cá nhân** (1 người / 1 MSSV).  
 > 🎯 **Mục tiêu:** đóng vai **Blue Team** để học cách xây Guardrails phòng thủ, rồi đóng vai **Red Team** để tấn công agent **Red** hoặc **Red Advance**.  
 > ✅ Làm theo **Checkpoint 1 → 5** trong [`CHECKPOINTS.md`](CHECKPOINTS.md) · nộp theo [`SUBMISSION.md`](SUBMISSION.md).
